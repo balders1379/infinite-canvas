@@ -5,8 +5,11 @@ import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, nor
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
+import { generateRunningHubAudio } from "./runninghub";
+import type { ReferenceImage } from "@/types/image";
+import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-type RequestOptions = { signal?: AbortSignal };
+type RequestOptions = { signal?: AbortSignal; images?: ReferenceImage[]; videos?: ReferenceVideo[]; audios?: ReferenceAudio[] };
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 function aiApiUrl(config: AiConfig, path: string) {
@@ -44,6 +47,13 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
         }
     }
     assertAudioConfig(requestConfig, model);
+    if (requestConfig.apiFormat === "runninghub") {
+        try {
+            return await generateRunningHubAudio(requestConfig, requestConfig.runningHub, { prompt, images: options?.images, videos: options?.videos, audios: options?.audios }, options);
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
+        }
+    }
     const instructions = config.audioInstructions.trim();
 
     try {

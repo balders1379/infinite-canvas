@@ -4,8 +4,9 @@ import { persist } from "zustand/middleware";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import type { RunningHubWorkflow } from "@/types/runninghub";
 
-export type ApiCallFormat = "openai" | "gemini";
+export type ApiCallFormat = "openai" | "gemini" | "runninghub";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
@@ -13,6 +14,7 @@ export type ChannelModel = {
     name: string;
     capability: ModelCapability;
     script?: string;
+    runningHub?: RunningHubWorkflow;
 };
 
 export type ModelChannel = {
@@ -56,6 +58,8 @@ export type AiConfig = {
     proxyUrl: string;
     nodeRegenerateBehavior: "new-node" | "overwrite";
     autoFocusOnSelect: boolean;
+    /** Set by resolveModelRequestConfig from the selected model; never persisted. */
+    runningHub?: RunningHubWorkflow;
 };
 
 export type WebdavSyncConfig = {
@@ -76,6 +80,7 @@ export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+const RUNNINGHUB_BASE_URL = "https://www.runninghub.cn";
 export const LOCAL_PROXY_PACKAGE = "@basketikun/canvas-proxy";
 export const DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:23210";
 
@@ -296,6 +301,15 @@ export function useEffectiveConfig() {
     return useMemo(() => ({ ...config, channelMode: "local" as const }), [config]);
 }
 
+function normalizeRunningHubWorkflow(workflow: RunningHubWorkflow | undefined): RunningHubWorkflow | undefined {
+    const workflowId = workflow?.workflowId?.trim();
+    if (!workflowId) return undefined;
+    const mappings = (workflow?.mappings || [])
+        .map((mapping) => ({ ...mapping, nodeId: mapping.nodeId?.trim(), fieldName: mapping.fieldName?.trim() }))
+        .filter((mapping) => mapping.nodeId && mapping.fieldName);
+    return { workflowId, mappings };
+}
+
 /** Normalize a mixed list of raw model names or model objects into deduped ChannelModel entries. */
 export function normalizeChannelModels(models: Array<string | ChannelModel> | undefined): ChannelModel[] {
     const seen = new Set<string>();
@@ -306,7 +320,8 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
         seen.add(name);
         const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
         const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
-        result.push({ name, capability, script });
+        const runningHub = typeof item === "string" ? undefined : normalizeRunningHubWorkflow(item.runningHub);
+        result.push({ name, capability, script, runningHub });
     }
     return result;
 }
@@ -437,12 +452,14 @@ export function resolveModelChannel(config: AiConfig, value: string) {
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
     const channel = resolveModelChannel(config, value);
+    const model = modelOptionName(value || config.model);
     return {
         ...config,
-        model: modelOptionName(value || config.model),
+        model,
         baseUrl: channel.baseUrl,
         apiKey: channel.apiKey,
         apiFormat: channel.apiFormat,
+        runningHub: channel.models.find((item) => item.name === model)?.runningHub,
     };
 }
 
@@ -473,11 +490,12 @@ function normalizeChannels(config: AiConfig) {
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
+    if (apiFormat === "runninghub") return RUNNINGHUB_BASE_URL;
     return OPENAI_BASE_URL;
 }
 
 function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    return apiFormat === "gemini" ? apiFormat : "openai";
+    return apiFormat === "gemini" || apiFormat === "runninghub" ? apiFormat : "openai";
 }
 
 function uniqueModelOptions(models: string[]) {

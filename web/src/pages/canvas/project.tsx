@@ -8,7 +8,7 @@ import { useTranslation } from "react-i18next";
 import { requestEdit, requestGeneration, requestImageQuestion } from "@/services/api/image";
 import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { createVideoGenerationTask, isVideoTaskFailed, storeGeneratedVideo, waitForVideoGenerationTask } from "@/services/api/video";
-import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
+import { defaultConfig, resolveModelRequestConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { ensureImagePreview, uploadImage } from "@/services/image-storage";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
@@ -319,8 +319,9 @@ function InfiniteCanvasPage() {
     const completeVideoNodeTask = useCallback(
         async (nodeId: string, config: Parameters<typeof buildGenerationConfig>[0], prompt: string, images: Parameters<typeof createVideoGenerationTask>[2], signal: AbortSignal, extra: CanvasNodeData["metadata"] = {}, videos: ReferenceVideo[] = [], audios: ReferenceAudio[] = []) => {
             const task = await createVideoGenerationTask(config, prompt, images, { signal, videos, audios });
-            if (task.provider !== "plugin") {
-                setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, videoTaskId: task.id, videoTaskProvider: task.provider === "gemini" ? "gemini" : "openai", model: config.model } } : item)));
+            const provider = task.provider;
+            if (provider !== "plugin") {
+                setNodes((prev) => prev.map((item) => (item.id === nodeId ? { ...item, metadata: { ...item.metadata, videoTaskId: task.id, videoTaskProvider: provider, model: config.model } } : item)));
             }
             const video = await storeGeneratedVideo(await waitForVideoGenerationTask(config, task, { signal }));
             setNodes((prev) => prev.map((item) => (item.id === nodeId ? applyGeneratedVideo(item, video, { prompt, model: config.model, ...extra }) : item)));
@@ -347,7 +348,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(node.id);
                 setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined } } : item)));
                 controller = startGenerationRequest(node.id, node.id, node.id);
-                const video = await storeGeneratedVideo(await waitForVideoGenerationTask(generationConfig, { id: taskId, provider: node.metadata?.videoTaskProvider === "gemini" ? "gemini" : "openai", model: generationConfig.model }, { signal: controller.signal }));
+                const video = await storeGeneratedVideo(await waitForVideoGenerationTask(generationConfig, { id: taskId, provider: node.metadata?.videoTaskProvider || "openai", model: generationConfig.model }, { signal: controller.signal }));
                 setNodes((prev) =>
                     prev.map((item) =>
                         item.id === node.id
@@ -2470,6 +2471,67 @@ function InfiniteCanvasPage() {
                     let hasSuccess = false;
                     let hasFailure = false;
                     let firstError = "";
+                    // RunningHub runs the workflow once and returns all its outputs; `count` only sizes the placeholders.
+                    if (resolveModelRequestConfig(generationConfig, generationConfig.model).apiFormat === "runninghub") {
+                        try {
+                            const items = referenceImages.length
+                                ? await requestEdit({ ...generationConfig, count: "1" }, effectivePrompt, referenceImages, { signal: controller.signal })
+                                : await requestGeneration({ ...generationConfig, count: "1" }, effectivePrompt, { signal: controller.signal });
+                            const uploadedImages: CanvasNodeImage[] = [];
+                            for (const image of items) {
+                                const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
+                                uploadedImages.push({ id: nanoid(), status: NODE_STATUS_SUCCESS, content: uploaded.url, storageKey: uploaded.storageKey, naturalWidth: uploaded.width, naturalHeight: uploaded.height, bytes: uploaded.bytes, mimeType: uploaded.mimeType });
+                            }
+                            if (!uploadedImages.length) throw new Error(t("canvas.projectPage.generationFailed"));
+                            const first = uploadedImages[0];
+                            const imageSize = fitNodeSize(first.naturalWidth, first.naturalHeight, imageConfig.width, imageConfig.height);
+                            setNodes((prev) =>
+                                prev.map((node) => {
+                                    if (node.id !== rootId) return node;
+                                    const center = { x: node.position.x + node.width / 2, y: node.position.y + node.height / 2 };
+                                    return {
+                                        ...node,
+                                        position: { x: center.x - imageSize.width / 2, y: center.y - imageSize.height / 2 },
+                                        ...imageSize,
+                                        metadata: {
+                                            ...node.metadata,
+                                            content: first.content,
+                                            storageKey: first.storageKey,
+                                            naturalWidth: first.naturalWidth,
+                                            naturalHeight: first.naturalHeight,
+                                            bytes: first.bytes,
+                                            mimeType: first.mimeType,
+                                            images: uploadedImages,
+                                            primaryImageId: first.id,
+                                            count: uploadedImages.length,
+                                        },
+                                    };
+                                }),
+                            );
+                            hasSuccess = true;
+                            if (isConfigNode) setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS, errorDetails: undefined } } : node)));
+                        } catch (error) {
+                            if (isGenerationCanceled(error)) {
+                                if (rootId !== nodeId) finishGenerationRequest(rootId, controller);
+                                return;
+                            }
+                            firstError = error instanceof Error ? error.message : t("canvas.projectPage.generationFailed");
+                            hasFailure = true;
+                            setNodes((prev) => prev.map((node) => (node.id === rootId ? { ...node, metadata: { ...node.metadata, images: node.metadata?.images?.map((image) => ({ ...image, status: NODE_STATUS_ERROR, errorDetails: firstError })) } } : node)));
+                        }
+                        if (rootId !== nodeId) finishGenerationRequest(rootId, controller);
+                        if (hasFailure) message.error(firstError || t("canvas.projectPage.generationFailed"));
+                        setNodes((prev) =>
+                            prev.map((node) =>
+                                node.id === nodeId && isConfigNode
+                                    ? { ...node, metadata: { ...node.metadata, status: hasSuccess ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: hasSuccess ? undefined : t("canvas.projectPage.allFailed") } }
+                                    : node.id === rootId
+                                      ? { ...node, metadata: { ...node.metadata, status: hasSuccess ? NODE_STATUS_SUCCESS : NODE_STATUS_ERROR, errorDetails: hasSuccess ? undefined : t("canvas.projectPage.allFailed") } }
+                                      : node,
+                            ),
+                        );
+                        return;
+                    }
                     await Promise.all(
                         imageIds.map(async (imageId) => {
                             try {
@@ -2610,7 +2672,15 @@ function InfiniteCanvasPage() {
                     if (!reuseAudioNode) setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: nodeId, toNodeId: audioId }]);
                     const controller = startGenerationRequest(audioId, nodeId, nodeId, runController);
                     try {
-                        const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, effectivePrompt, { signal: controller.signal }), generationConfig.audioFormat);
+                        const audio = await storeGeneratedAudio(
+                            await requestAudioGeneration(generationConfig, effectivePrompt, {
+                                signal: controller.signal,
+                                images: generationContext.referenceImages,
+                                videos: generationContext.referenceVideos,
+                                audios: generationContext.referenceAudios,
+                            }),
+                            generationConfig.audioFormat,
+                        );
                         setNodes((prev) => prev.map((node) => (node.id === audioId ? { ...node, metadata: { ...node.metadata, ...audioMetadata(audio), prompt: effectivePrompt, ...buildAudioGenerationMetadata(generationConfig) } } : node)));
                     } finally {
                         finishGenerationRequest(audioId, controller);
@@ -2839,7 +2909,10 @@ function InfiniteCanvasPage() {
                     return;
                 }
                 if (node.type === CanvasNodeType.Audio) {
-                    const audio = await storeGeneratedAudio(await requestAudioGeneration(generationConfig, prompt, { signal: controller.signal }), generationConfig.audioFormat);
+                    const audio = await storeGeneratedAudio(
+                        await requestAudioGeneration(generationConfig, prompt, { signal: controller.signal, images: context?.referenceImages, videos: context?.referenceVideos, audios: context?.referenceAudios }),
+                        generationConfig.audioFormat,
+                    );
                     setNodes((prev) => prev.map((item) => (item.id === node.id ? { ...item, metadata: { ...item.metadata, ...audioMetadata(audio), prompt, ...buildAudioGenerationMetadata(generationConfig) } } : item)));
                     return;
                 }

@@ -37,6 +37,7 @@ type GeneratedVideo = {
 type GenerationResult = {
     id: string;
     status: "pending" | "success" | "failed";
+    phase?: "queued" | "running";
     video?: GeneratedVideo;
     error?: string;
 };
@@ -101,6 +102,7 @@ export default function VideoPage() {
     const updateAgentTask = useWorkbenchAgentStore((state) => state.updateTask);
     const processedCommandRef = useRef(0);
     const agentTaskIdRef = useRef<string | undefined>(undefined);
+    const controllersRef = useRef<Set<AbortController>>(new Set());
 
     const model = effectiveConfig.videoModel || effectiveConfig.model;
     const canGenerate = Boolean(prompt.trim());
@@ -183,19 +185,30 @@ export default function VideoPage() {
         setResults([{ id: nanoid(), status: "pending" }]);
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
+        const controller = new AbortController();
+        controllersRef.current.add(controller);
         try {
-            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references);
+            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references, { signal: controller.signal });
             const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: 0, status: "pending", task });
             await saveLog(log, false);
-            void pollGenerationLog(log, snapshot.config, agentTaskId);
+            void pollGenerationLog(log, snapshot.config, agentTaskId, controller);
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
+            const canceled = controller.signal.aborted;
+            const errorMessage = canceled ? t("common.requestCanceled") : error instanceof Error ? error.message : t("workbench.generationFailed");
             setResults([{ id: nanoid(), status: "failed", error: errorMessage }]);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
             await saveLog(buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: performance.now() - batchStartedAt, status: "failed", error: errorMessage }));
-            message.error(errorMessage);
+            if (canceled) message.info(t("workbench.stopped"));
+            else message.error(errorMessage);
             setRunning(false);
+            // Only drop the controller here when polling never started; pollGenerationLog owns it otherwise.
+            controllersRef.current.delete(controller);
         }
+    };
+
+    const stopGeneration = () => {
+        controllersRef.current.forEach((controller) => controller.abort());
+        controllersRef.current.clear();
     };
 
     // Handle video-generation commands from the Agent panel by setting the prompt and optionally starting generation.
@@ -303,20 +316,29 @@ export default function VideoPage() {
 
     const resumePendingLogs = (items: GenerationLog[]) => {
         for (const log of items) {
-            if (log.status === "pending" && log.task) void pollGenerationLog(log);
+            if (log.status === "pending" && log.task && !activeLogIdsRef.current.has(log.id)) {
+                const controller = new AbortController();
+                controllersRef.current.add(controller);
+                void pollGenerationLog(log, undefined, undefined, controller);
+            }
         }
     };
 
-    const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string) => {
+    const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string, controller = new AbortController()) => {
         if (!log.task || activeLogIdsRef.current.has(log.id)) return;
         activeLogIdsRef.current.add(log.id);
+        controllersRef.current.add(controller);
         setRunning(true);
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
+        const setPhase = (phase: "queued" | "running") => setResults((value) => value.map((item) => (item.status === "pending" ? { ...item, phase } : item)));
+        // RunningHub has no overall deadline; the workbench stop button aborts it.
+        const maxAttempts = log.task.provider === "runninghub" ? Infinity : 120;
         try {
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
+            for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+                if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task, { signal: controller.signal });
                 if (state.status === "completed") {
                     const stored = await storeGeneratedVideo(state.result);
                     const nextVideo: GeneratedVideo = {
@@ -337,15 +359,19 @@ export default function VideoPage() {
                 }
                 if (state.status === "failed") throw new Error(state.error);
                 if (attempt === 119) throw new Error(t("videoWorkbench.timeout"));
-                await delay(2500);
+                if (state.phase) setPhase(state.phase);
+                await delay(2500, controller.signal);
             }
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
+            const canceled = controller.signal.aborted;
+            const errorMessage = canceled ? t("common.requestCanceled") : error instanceof Error ? error.message : t("workbench.generationFailed");
             setResults([{ id: log.id, status: "failed", error: errorMessage }]);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
             await saveLog({ ...log, status: "failed", durationMs: Date.now() - log.createdAt, error: errorMessage });
-            message.error(errorMessage);
+            if (canceled) message.info(t("workbench.stopped"));
+            else message.error(errorMessage);
         } finally {
+            controllersRef.current.delete(controller);
             activeLogIdsRef.current.delete(log.id);
             if (!activeLogIdsRef.current.size) {
                 setRunning(false);
@@ -457,9 +483,15 @@ export default function VideoPage() {
                         </div>
 
                         <div className="mt-auto pt-6">
-                            <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} loading={running} disabled={!canGenerate || running} onClick={() => void generate()}>
-                                {t("workbench.generate")}
-                            </Button>
+                            {running ? (
+                                <Button size="large" block danger onClick={stopGeneration}>
+                                    {t("workbench.stopGeneration")}
+                                </Button>
+                            ) : (
+                                <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} disabled={!canGenerate} onClick={() => void generate()}>
+                                    {t("workbench.generate")}
+                                </Button>
+                            )}
                         </div>
                     </div>
 
@@ -470,7 +502,7 @@ export default function VideoPage() {
                         </div>
                         {results.length ? (
                             <div className="grid gap-4">
-                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} />))}
+                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} phase={result.phase} />))}
                             </div>
                         ) : (
                             <div className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700 lg:min-h-[560px]">
@@ -552,13 +584,13 @@ function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedV
     );
 }
 
-function PendingVideoCard() {
+function PendingVideoCard({ phase }: { phase?: "queued" | "running" }) {
     const { t } = useTranslation();
     return (
         <div className="relative aspect-video overflow-hidden rounded-lg border border-dashed border-stone-300 bg-stone-50 dark:border-stone-700 dark:bg-stone-900">
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
                 <LoaderCircle className="size-6 animate-spin" />
-                <span>{t("workbench.generating")}</span>
+                <span>{t(phase === "queued" ? "workbench.queued" : phase === "running" ? "workbench.running" : "workbench.generating")}</span>
             </div>
         </div>
     );
@@ -797,6 +829,20 @@ function normalizeResolution(value: string) {
     return normalizeVideoResolutionValue(value);
 }
 
-function delay(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms: number, signal?: AbortSignal) {
+    return new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+            "abort",
+            () => {
+                clearTimeout(timer);
+                reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+        );
+    });
 }

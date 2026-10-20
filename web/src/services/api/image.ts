@@ -3,6 +3,7 @@ import axios from "axios";
 import i18n from "@/i18n";
 import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
+import { generateRunningHubImages, type RunningHubPhase } from "./runninghub";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
@@ -95,7 +96,7 @@ type GeminiPayload = {
     promptFeedback?: { blockReason?: string };
 };
 type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string };
-type RequestOptions = { signal?: AbortSignal };
+type RequestOptions = { signal?: AbortSignal; onPhase?: (phase: RunningHubPhase) => void };
 
 const IMAGE_QUALITY_VALUES = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_IMAGE_SHORT_SIDE = 1024;
@@ -714,6 +715,14 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (requestConfig.apiFormat === "runninghub") {
+        try {
+            const urls = await generateRunningHubImages(requestConfig, requestConfig.runningHub, withSystemPrompt(requestConfig, prompt), [], options);
+            return urls.map((dataUrl) => ({ id: nanoid(), dataUrl }));
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
     if (requestConfig.apiFormat === "gemini") {
         try {
             return await requestGeminiImages(requestConfig, prompt, [], n, options);
@@ -772,6 +781,15 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
                 signal: options?.signal,
             });
             return normalizePluginImages(result).map((dataUrl) => ({ id: nanoid(), dataUrl }));
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("requestFailed")));
+        }
+    }
+    if (requestConfig.apiFormat === "runninghub") {
+        try {
+            // Reference images go through RunningHub uploads; do not fold them into the prompt text.
+            const urls = await generateRunningHubImages(requestConfig, requestConfig.runningHub, withSystemPrompt(requestConfig, prompt), references, options);
+            return urls.map((dataUrl) => ({ id: nanoid(), dataUrl }));
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }

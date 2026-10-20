@@ -8,6 +8,7 @@ import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } fro
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
+import { cancelRunningHubTask, createRunningHubTask, pollRunningHubVideoTask, type RunningHubPhase } from "./runninghub";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
@@ -19,7 +20,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin" | "runninghub"; model: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -27,7 +28,7 @@ type GeminiVideoOperation = {
     error?: { message?: string };
     response?: { generateVideoResponse?: { generatedSamples?: Array<{ video?: { uri?: string } }> } };
 };
-export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
+export type VideoGenerationTaskState = { status: "pending"; phase?: RunningHubPhase } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
 
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
 const pluginVideoResults = new Map<string, VideoGenerationResult>();
@@ -48,13 +49,21 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
 }
 
 export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationResult> {
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        const state = await pollVideoGenerationTask(config, task, options);
-        if (state.status === "completed") return state.result;
-        if (state.status === "failed") throw videoTaskFailed(state.error);
-        if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
-        await delay(2500, options?.signal);
+    // RunningHub has no overall deadline; the caller stops it through the abort signal.
+    const maxAttempts = task.provider === "runninghub" ? Infinity : 120;
+    try {
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+            if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+            const state = await pollVideoGenerationTask(config, task, options);
+            if (state.status === "completed") return state.result;
+            if (state.status === "failed") throw videoTaskFailed(state.error);
+            if (attempt === 119) throw new Error(apiText("videoTimeout", { provider: "" }));
+            await delay(2500, options?.signal);
+        }
+    } catch (error) {
+        // Stopped locally while waiting between polls: also cancel the remote task.
+        if (task.provider === "runninghub" && options?.signal?.aborted) await cancelRunningHubTask(config, task.id);
+        throw error;
     }
     throw new Error(apiText("videoTimeout", { provider: "" }));
 }
@@ -75,6 +84,14 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     const script = resolveModelScript(config, selectedModel);
     if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
+    if (requestConfig.apiFormat === "runninghub") {
+        try {
+            const taskId = await createRunningHubTask(requestConfig, requestConfig.runningHub, { prompt, images: references, videos: options?.videos, audios: options?.audios }, options);
+            return { id: taskId, provider: "runninghub", model: selectedModel };
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
+        }
+    }
     if (requestConfig.apiFormat === "gemini") return createGeminiVideoTask(requestConfig, selectedModel, prompt, references, options);
     return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
 }
@@ -86,6 +103,16 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     }
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
+    if (task.provider === "runninghub") {
+        try {
+            const state = await pollRunningHubVideoTask(requestConfig, task.id, options);
+            if (state.status === "completed") return { status: "completed", result: await videoResultFromUrl(state.url, options) };
+            if (state.status === "failed") return { status: "failed", error: state.error };
+            return { status: "pending", phase: state.phase };
+        } catch (error) {
+            throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+        }
+    }
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
